@@ -16,9 +16,11 @@ const path = require('path');
 const express = require('express');
 const qrcode = require('qrcode');
 const pino = require('pino');
+const { NodeCache } = require('@cacheable/node-cache');
 const {
     default: makeWASocket,
     useMultiFileAuthState,
+    makeCacheableSignalKeyStore,
     fetchLatestBaileysVersion,
     DisconnectReason,
     Browsers,
@@ -284,6 +286,19 @@ async function whatsappVersion() {
     return waVersion;
 }
 
+// What was sent, kept for a day so a retry request can be answered.
+const sentMessages = new NodeCache({ stdTTL: 24 * 60 * 60, useClones: false, maxKeys: 20000 });
+const msgRetryCounterCache = new NodeCache({ stdTTL: 60 * 60, useClones: false });
+
+function rememberSent(sessionId, sent) {
+    if (!sent || !sent.key || !sent.key.id || !sent.message) return;
+    try {
+        sentMessages.set(`${sessionId}:${sent.key.id}`, sent.message);
+    } catch (err) {
+        console.warn(`[${sessionId}] could not keep message for retries:`, err.message);
+    }
+}
+
 async function startSession(sessionId, startedByHuman) {
     const existing = sessions.get(sessionId);
     if (existing && existing.status !== 'disconnected') return existing;
@@ -304,8 +319,15 @@ async function startSession(sessionId, startedByHuman) {
 
     const sock = makeWASocket({
         version,
-        auth: state,
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, logger),
+        },
         logger,
+        // A recipient that cannot decrypt a message asks for it again. Without
+        // these two it stays on "Waiting for this message" on their phone.
+        msgRetryCounterCache,
+        getMessage: async (key) => sentMessages.get(`${sessionId}:${key.id}`),
         printQRInTerminal: false,
         browser: Browsers.ubuntu('Chrome'),
         // We only ever send. Pulling chat history and broadcasting presence
@@ -535,6 +557,7 @@ app.post('/send', requireApiKey, requireSessionAccess, async (req, res) => {
             SEND_TIMEOUT_MS,
             'send',
         );
+        rememberSent(session, sent);
         console.log(`[${session}] send took ${Date.now() - t0}ms`);
         res.json({ ok: true, id: sent && sent.key ? sent.key.id : null });
     } catch (e) {
@@ -570,6 +593,7 @@ app.post('/send-document', requireApiKey, requireSessionAccess, async (req, res)
             SEND_TIMEOUT_MS,
             'send-document',
         );
+        rememberSent(session, sent);
         console.log(`[${session}] send-document took ${Date.now() - t0}ms`);
         res.json({ ok: true, id: sent && sent.key ? sent.key.id : null });
     } catch (e) {

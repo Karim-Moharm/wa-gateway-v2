@@ -11,6 +11,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@cacheable/node-cache": "^1.4.0",
     "baileys": "^6.7.24",
     "dotenv": "^16.6.1",
     "express": "^4.22.2",
