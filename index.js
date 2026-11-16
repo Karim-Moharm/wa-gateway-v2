@@ -569,7 +569,7 @@ async function lookupOne(sock, digits) {
     const [profiled, abouted, pictured] = await Promise.allSettled([
         withTimeout(sock.getBusinessProfile(jid), PROFILE_TIMEOUT_MS, 'business profile'),
         withTimeout(sock.fetchStatus(jid), PROFILE_TIMEOUT_MS, 'about'),
-        withTimeout(sock.profilePictureUrl(jid, 'preview'), PROFILE_TIMEOUT_MS, 'photo'),
+        withTimeout(sock.profilePictureUrl(jid, 'image'), PROFILE_TIMEOUT_MS, 'photo'),
     ]);
     const profile = profiled.status === 'fulfilled' ? profiled.value : null;
     if (profile) {
