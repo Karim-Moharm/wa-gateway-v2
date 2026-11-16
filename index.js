@@ -542,6 +542,66 @@ async function resolveSendTarget(req, res) {
     return { s, jid };
 }
 
+// Look up numbers: are they on WhatsApp, and what a business account shows publicly.
+// body: { session, phones: ["2010...", ...] }
+// Paced on purpose: WhatsApp bans an account that queries numbers in bursts.
+const LOOKUP_MAX_PHONES = 25;
+const LOOKUP_GAP_MS = Number(process.env.LOOKUP_GAP_MS || 1500);
+
+async function lookupOne(sock, digits) {
+    const found = await withTimeout(sock.onWhatsApp(digits), LOOKUP_TIMEOUT_MS, 'number lookup');
+    const entry = Array.isArray(found) ? found[0] : null;
+    if (!entry || !entry.exists) return { phone: digits, exists: false };
+    const jid = entry.jid || `${digits}@s.whatsapp.net`;
+    const result = { phone: digits, exists: true, name: entry.verifiedName || '' };
+    try {
+        const profile = await withTimeout(sock.getBusinessProfile(jid), LOOKUP_TIMEOUT_MS, 'business profile');
+        if (profile) {
+            result.name = result.name || profile.business_name || '';
+            result.description = profile.description || '';
+            result.address = profile.address || '';
+            result.website = (profile.website && profile.website[0]) || '';
+            result.email = profile.email || '';
+            const category = profile.category || (profile.categories && profile.categories[0]);
+            result.category = (category && (category.name || category)) || '';
+        }
+    } catch (e) {
+        // A personal account has no business profile; that is an answer, not a failure.
+    }
+    return result;
+}
+
+app.post('/lookup', requireApiKey, requireSessionAccess, async (req, res) => {
+    const { session, phones } = req.body || {};
+    if (!session || !Array.isArray(phones) || !phones.length) {
+        return res.status(400).json({ ok: false, error: 'session and phones are required' });
+    }
+    if (phones.length > LOOKUP_MAX_PHONES) {
+        return res.status(400).json({ ok: false, error: `at most ${LOOKUP_MAX_PHONES} numbers per request` });
+    }
+    let s = sessions.get(session);
+    if (!s || s.status !== 'connected') s = await healSession(session);
+    if (!s || s.status !== 'connected') {
+        return res.status(409).json({ ok: false, error: `session '${session}' not connected` });
+    }
+    const results = [];
+    for (const phone of phones) {
+        const digits = String(phone || '').replace(/\D/g, '');
+        if (!digits) {
+            results.push({ phone: String(phone || ''), exists: false, error: 'invalid phone' });
+            continue;
+        }
+        try {
+            results.push(await lookupOne(s.sock, digits));
+        } catch (e) {
+            results.push({ phone: digits, exists: false, error: e.message || String(e) });
+        }
+        if (LOOKUP_GAP_MS) await new Promise((done) => setTimeout(done, LOOKUP_GAP_MS));
+    }
+    console.log(`[${session}] looked up ${results.length} number(s)`);
+    res.json({ ok: true, results });
+});
+
 // Send a text message. body: { session, phone, message }
 app.post('/send', requireApiKey, requireSessionAccess, async (req, res) => {
     const { session, phone, message } = req.body || {};
