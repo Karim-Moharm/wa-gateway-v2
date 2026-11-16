@@ -546,16 +546,28 @@ async function resolveSendTarget(req, res) {
 // body: { session, phones: ["2010...", ...] }
 // Paced on purpose: WhatsApp bans an account that queries numbers in bursts.
 const LOOKUP_MAX_PHONES = 25;
-const LOOKUP_GAP_MS = Number(process.env.LOOKUP_GAP_MS || 1500);
+const LOOKUP_GAP_MS = Number(process.env.LOOKUP_GAP_MS || 400);
+const LOOKUP_AT_ONCE = Number(process.env.LOOKUP_AT_ONCE || 4);
+// A personal number has no business profile and the request simply never answers, so this waits
+// seconds, not the 12 a send is allowed.
+const PROFILE_TIMEOUT_MS = Number(process.env.PROFILE_TIMEOUT_MS || 3500);
+const lookupCache = new Map();   // digits -> { at, result }
+const LOOKUP_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 async function lookupOne(sock, digits) {
+    const hit = lookupCache.get(digits);
+    if (hit && Date.now() - hit.at < LOOKUP_CACHE_TTL_MS) return { ...hit.result, cached: true };
     const found = await withTimeout(sock.onWhatsApp(digits), LOOKUP_TIMEOUT_MS, 'number lookup');
     const entry = Array.isArray(found) ? found[0] : null;
-    if (!entry || !entry.exists) return { phone: digits, exists: false };
+    if (!entry || !entry.exists) {
+        const missing = { phone: digits, exists: false };
+        lookupCache.set(digits, { at: Date.now(), result: missing });
+        return missing;
+    }
     const jid = entry.jid || `${digits}@s.whatsapp.net`;
     const result = { phone: digits, exists: true, name: entry.verifiedName || '' };
     try {
-        const profile = await withTimeout(sock.getBusinessProfile(jid), LOOKUP_TIMEOUT_MS, 'business profile');
+        const profile = await withTimeout(sock.getBusinessProfile(jid), PROFILE_TIMEOUT_MS, 'business profile');
         if (profile) {
             result.name = result.name || profile.business_name || '';
             result.description = profile.description || '';
@@ -568,6 +580,7 @@ async function lookupOne(sock, digits) {
     } catch (e) {
         // A personal account has no business profile; that is an answer, not a failure.
     }
+    lookupCache.set(digits, { at: Date.now(), result });
     return result;
 }
 
@@ -584,21 +597,24 @@ app.post('/lookup', requireApiKey, requireSessionAccess, async (req, res) => {
     if (!s || s.status !== 'connected') {
         return res.status(409).json({ ok: false, error: `session '${session}' not connected` });
     }
+    const t0 = Date.now();
     const results = [];
-    for (const phone of phones) {
-        const digits = String(phone || '').replace(/\D/g, '');
-        if (!digits) {
-            results.push({ phone: String(phone || ''), exists: false, error: 'invalid phone' });
-            continue;
+    for (let at = 0; at < phones.length; at += LOOKUP_AT_ONCE) {
+        const slice = phones.slice(at, at + LOOKUP_AT_ONCE).map((phone) => String(phone || '').replace(/\D/g, ''));
+        const batch = await Promise.all(slice.map(async (digits, index) => {
+            if (!digits) return { phone: String(phones[at + index] || ''), exists: false, error: 'invalid phone' };
+            try {
+                return await lookupOne(s.sock, digits);
+            } catch (e) {
+                return { phone: digits, exists: false, error: e.message || String(e) };
+            }
+        }));
+        results.push(...batch);
+        if (LOOKUP_GAP_MS && at + LOOKUP_AT_ONCE < phones.length) {
+            await new Promise((done) => setTimeout(done, LOOKUP_GAP_MS));
         }
-        try {
-            results.push(await lookupOne(s.sock, digits));
-        } catch (e) {
-            results.push({ phone: digits, exists: false, error: e.message || String(e) });
-        }
-        if (LOOKUP_GAP_MS) await new Promise((done) => setTimeout(done, LOOKUP_GAP_MS));
     }
-    console.log(`[${session}] looked up ${results.length} number(s)`);
+    console.log(`[${session}] looked up ${results.length} number(s) in ${Date.now() - t0}ms`);
     res.json({ ok: true, results });
 });
 
