@@ -566,20 +566,26 @@ async function lookupOne(sock, digits) {
     }
     const jid = entry.jid || `${digits}@s.whatsapp.net`;
     const result = { phone: digits, exists: true, name: entry.verifiedName || '' };
-    try {
-        const profile = await withTimeout(sock.getBusinessProfile(jid), PROFILE_TIMEOUT_MS, 'business profile');
-        if (profile) {
-            result.name = result.name || profile.business_name || '';
-            result.description = profile.description || '';
-            result.address = profile.address || '';
-            result.website = (profile.website && profile.website[0]) || '';
-            result.email = profile.email || '';
-            const category = profile.category || (profile.categories && profile.categories[0]);
-            result.category = (category && (category.name || category)) || '';
-        }
-    } catch (e) {
-        // A personal account has no business profile; that is an answer, not a failure.
+    const [profiled, abouted, pictured] = await Promise.allSettled([
+        withTimeout(sock.getBusinessProfile(jid), PROFILE_TIMEOUT_MS, 'business profile'),
+        withTimeout(sock.fetchStatus(jid), PROFILE_TIMEOUT_MS, 'about'),
+        withTimeout(sock.profilePictureUrl(jid, 'preview'), PROFILE_TIMEOUT_MS, 'photo'),
+    ]);
+    const profile = profiled.status === 'fulfilled' ? profiled.value : null;
+    if (profile) {
+        result.name = result.name || profile.business_name || '';
+        result.description = profile.description || '';
+        result.address = profile.address || '';
+        result.website = (profile.website && profile.website[0]) || '';
+        result.email = profile.email || '';
+        const category = profile.category || (profile.categories && profile.categories[0]);
+        result.category = (category && (category.name || category)) || '';
     }
+    if (abouted.status === 'fulfilled' && Array.isArray(abouted.value)) {
+        const row = abouted.value[0];
+        result.about = (row && row.status && row.status.status) || '';
+    }
+    if (pictured.status === 'fulfilled') result.photo = pictured.value || '';
     lookupCache.set(digits, { at: Date.now(), result });
     return result;
 }
